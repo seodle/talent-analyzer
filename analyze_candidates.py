@@ -150,6 +150,19 @@ def truncate_text(value: str, max_chars: int) -> str:
     return value[:max_chars] + "\n[TRONQUÉ]"
 
 
+def parse_criteria_list(criteria_text: str) -> List[str]:
+    items: List[str] = []
+    for raw in criteria_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Remove common bullet prefixes
+        line = re.sub(r"^(?:[-*•]\s+|\d+\)\s+|\d+\.\s+)", "", line)
+        if line:
+            items.append(line)
+    return items
+
+
 def read_env() -> Tuple[str, str]:
     load_dotenv()
     product_id = os.getenv("PRODUCT_ID")
@@ -196,8 +209,7 @@ def call_infomaniak_llm(prompt: str, product_id: str, api_key: str, timeout_seco
         return json.dumps(data)
 
 
-def build_scoring_prompt(criteria: str, candidate_name: str, cv_text: str, letter_text: str, has_cv: bool, has_letter: bool) -> str:
-    criteria = criteria.strip()
+def build_scoring_prompt(criteria_list: List[str], candidate_name: str, cv_text: str, letter_text: str, has_cv: bool, has_letter: bool) -> str:
     cv_text = truncate_text(cv_text.strip(), 12000)
     letter_text = truncate_text(letter_text.strip(), 8000)
     missing = []
@@ -208,10 +220,12 @@ def build_scoring_prompt(criteria: str, candidate_name: str, cv_text: str, lette
     missing_note = ", ".join(missing) if missing else ""
 
     instruction = (
-        "Tu es un assistant de recrutement francophone. Évalue ce candidat par rapport aux critères donnés. "
+        "Tu es un assistant de recrutement francophone. Évalue ce candidat par rapport aux critères. "
         "Réponds UNIQUEMENT avec un JSON valide, sans texte additionnel. "
-        "Le JSON doit contenir les clés: name, cv_relevance, letter_relevance, seniority, overall_score, fit_summary, risks. "
-        "Les scores sont sur 0-100. Pèse l'absence de documents s'il y en a."
+        "Le JSON doit contenir les clés: name, cv_relevance, letter_relevance, seniority, overall_score, fit_summary, risks, criteria_checklist. "
+        "criteria_checklist est une liste d'objets {criterion, status, source, evidence, confidence}. "
+        "status ∈ {met, partial, not_met}. source ∈ {cv, letter, both, none}. confidence ∈ [0,100]. "
+        "Pour evidence, cite une courte phrase ou mot-clé trouvé."
     )
 
     json_schema_hint = {
@@ -221,12 +235,16 @@ def build_scoring_prompt(criteria: str, candidate_name: str, cv_text: str, lette
         "seniority": 0,
         "overall_score": 0,
         "fit_summary": "",
-        "risks": ""
+        "risks": "",
+        "criteria_checklist": [
+            {"criterion": "", "status": "met", "source": "cv", "evidence": "", "confidence": 0}
+        ]
     }
 
+    criteria_block = "\n".join(f"- {c}" for c in criteria_list)
     prompt = (
         f"{instruction}\n\n"
-        f"Critères du poste:\n{criteria}\n\n"
+        f"Critères du poste (un par ligne):\n{criteria_block}\n\n"
         f"Informations manquantes: {missing_note if missing_note else 'Aucune'}\n\n"
         f"=== CV ===\n{cv_text}\n\n=== Lettre de motivation ===\n{letter_text}\n\n"
         f"Schéma JSON attendu (exemple de structure, valeurs à recalculer):\n{json.dumps(json_schema_hint, ensure_ascii=False)}"
@@ -267,14 +285,38 @@ def safe_int(value: Optional[object]) -> int:
         return 0
 
 
-def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_key: str) -> Dict:
+def normalize_status(value: Optional[str]) -> str:
+    if not value:
+        return "not_met"
+    v = str(value).strip().lower()
+    if v in {"met", "ok", "oui", "yes", "true", "satisfait"}:
+        return "met"
+    if v in {"partial", "partiel", "partially_met", "partiellement"}:
+        return "partial"
+    return "not_met"
+
+
+def normalize_source(value: Optional[str]) -> str:
+    if not value:
+        return "none"
+    v = str(value).strip().lower()
+    if v in {"cv", "resume"}:
+        return "cv"
+    if v in {"letter", "lettre", "cover"}:
+        return "letter"
+    if v in {"both", "cv+letter", "cv_letter"}:
+        return "both"
+    return "none"
+
+
+def evaluate_candidate(criteria_list: List[str], docs: CandidateDocs, product_id: str, api_key: str) -> Dict:
     cv_text = extract_text_from_file(docs.cv_path)
     letter_text = extract_text_from_file(docs.letter_path)
     has_cv = docs.cv_path is not None and bool(cv_text.strip())
     has_letter = docs.letter_path is not None and bool(letter_text.strip())
     logging.info(f"Évaluation {docs.candidate_name} (CV:{has_cv} Lettre:{has_letter})")
 
-    prompt = build_scoring_prompt(criteria, docs.candidate_name, cv_text, letter_text, has_cv, has_letter)
+    prompt = build_scoring_prompt(criteria_list, docs.candidate_name, cv_text, letter_text, has_cv, has_letter)
 
     try:
         response_text = call_infomaniak_llm(prompt, product_id, api_key)
@@ -310,6 +352,28 @@ def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_
     seniority = safe_int(parsed.get("seniority"))
     overall = safe_int(parsed.get("overall_score"))
 
+    # Criteria checklist
+    raw_checklist = parsed.get("criteria_checklist") if isinstance(parsed, dict) else None
+    checklist: List[Dict[str, object]] = []
+    if isinstance(raw_checklist, list):
+        for item in raw_checklist:
+            if not isinstance(item, dict):
+                continue
+            criterion = str(item.get("criterion", "")).strip()
+            if not criterion:
+                continue
+            status = normalize_status(item.get("status"))
+            source = normalize_source(item.get("source"))
+            evidence = str(item.get("evidence", "")).strip()
+            confidence = safe_int(item.get("confidence"))
+            checklist.append({
+                "criterion": criterion,
+                "status": status,
+                "source": source,
+                "evidence": evidence,
+                "confidence": confidence,
+            })
+
     result.update({
         "cv_relevance": cv_rel,
         "letter_relevance": lt_rel,
@@ -317,6 +381,7 @@ def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_
         "overall_score": overall,
         "fit_summary": str(parsed.get("fit_summary", "")).strip(),
         "risks": str(parsed.get("risks", "")).strip(),
+        "criteria_checklist": checklist,
     })
     return result
 
@@ -354,6 +419,36 @@ def save_markdown(rows: List[Dict], out_path: Path, top_n: int) -> None:
         lines.append("")
         lines.append(f"- CV: {row['cv_relevance']} | Lettre: {row['letter_relevance']} | Séniorité: {row['seniority']}")
         lines.append(f"- CV trouvé: {row['has_cv']} | Lettre trouvée: {row['has_letter']}")
+        # Criteria checklist before synthesis
+        checklist = row.get("criteria_checklist") or []
+        if checklist:
+            lines.append("")
+            lines.append("**Critères**:")
+            lines.append("")
+            for item in checklist:
+                try:
+                    crit = item.get("criterion", "")
+                    status = item.get("status", "")
+                    source = item.get("source", "")
+                    evidence = item.get("evidence", "")
+                    conf = item.get("confidence", 0)
+                    # Display mapping
+                    src_label = {
+                        "cv": "CV",
+                        "letter": "Lettre",
+                        "both": "CV+Lettre",
+                        "none": "Aucune"
+                    }.get(str(source).lower(), str(source))
+                    status_label = {
+                        "met": "OK",
+                        "partial": "Partiel",
+                        "not_met": "Non"
+                    }.get(str(status).lower(), str(status))
+                    ev = f" — Extrait: {evidence}" if evidence else ""
+                    lines.append(f"- {crit} → {status_label} (Source: {src_label}, Confiance: {conf}){ev}")
+                except Exception:
+                    continue
+
         if row.get("fit_summary"):
             lines.append("")
             lines.append("**Synthèse**:")
@@ -392,6 +487,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default=".", help="Dossier de sortie pour les rapports")
     parser.add_argument("--top", type=int, default=10, help="Nombre de candidats à afficher dans le rapport Markdown")
     parser.add_argument("--limit", type=int, default=0, help="Limiter l'analyse aux N premiers dossiers (0 = tous)")
+    parser.add_argument("--candidate", type=str, default="", help="Analyser un candidat précis (format dossier: 'NOM Prénom')")
     parser.add_argument("--verbose", "-v", action="store_true", help="Activer les logs détaillés (DEBUG)")
     parser.add_argument("--log-file", type=str, default="", help="Écrire les logs dans ce fichier")
     args = parser.parse_args()
@@ -420,7 +516,24 @@ def main() -> None:
 
     candidate_dirs = find_candidate_dirs(candidates_root)
     logging.info(f"Dossiers candidats trouvés: {len(candidate_dirs)}")
-    if args.limit and args.limit > 0:
+    if args.candidate:
+        wanted = args.candidate.strip().lower()
+        # Normalize accents and spaces for robust matching
+        def nfkd(s: str) -> str:
+            import unicodedata as _ud
+            s2 = _ud.normalize("NFKD", s)
+            s2 = "".join(ch for ch in s2 if not _ud.combining(ch))
+            return re.sub(r"\s+", " ", s2).strip().lower()
+
+        wanted_n = nfkd(wanted)
+        filtered = [p for p in candidate_dirs if nfkd(p.name) == wanted_n]
+        if not filtered:
+            logging.error(f"Candidat non trouvé: {args.candidate}")
+            print(f"Candidat non trouvé: {args.candidate}", file=sys.stderr)
+            sys.exit(1)
+        candidate_dirs = filtered
+        logging.info(f"Filtre --candidate appliqué: {candidate_dirs[0].name}")
+    if not args.candidate and args.limit and args.limit > 0:
         candidate_dirs = candidate_dirs[: args.limit]
         logging.info(f"Limitation active: analyse des {len(candidate_dirs)} premiers dossiers")
         print(f"Limitation active: analyse des {len(candidate_dirs)} premiers dossiers")
