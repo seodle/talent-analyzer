@@ -374,6 +374,21 @@ def evaluate_candidate(criteria_list: List[str], docs: CandidateDocs, product_id
                 "confidence": confidence,
             })
 
+    # Ensure every criterion from criteria_list appears once
+    found_map = {str(item.get("criterion", "")).strip(): item for item in checklist}
+    completed_checklist: List[Dict[str, object]] = []
+    for crit in criteria_list:
+        if crit in found_map and found_map[crit]:
+            completed_checklist.append(found_map[crit])
+        else:
+            completed_checklist.append({
+                "criterion": crit,
+                "status": "not_met",
+                "source": "none",
+                "evidence": "",
+                "confidence": 0,
+            })
+
     result.update({
         "cv_relevance": cv_rel,
         "letter_relevance": lt_rel,
@@ -381,7 +396,7 @@ def evaluate_candidate(criteria_list: List[str], docs: CandidateDocs, product_id
         "overall_score": overall,
         "fit_summary": str(parsed.get("fit_summary", "")).strip(),
         "risks": str(parsed.get("risks", "")).strip(),
-        "criteria_checklist": checklist,
+        "criteria_checklist": completed_checklist,
     })
     return result
 
@@ -543,10 +558,11 @@ def main() -> None:
         sys.exit(1)
 
     results: List[Dict] = []
+    crit_list = parse_criteria_list(criteria_text)
     for cand_dir in tqdm(candidate_dirs, desc="Analyse des candidats"):
         logging.debug(f"Traitement dossier: {cand_dir.name}")
         docs = classify_candidate_files(cand_dir)
-        result = evaluate_candidate(criteria_text, docs, product_id, api_key)
+        result = evaluate_candidate(crit_list, docs, product_id, api_key)
         results.append(result)
 
     # Sort by overall_score desc
