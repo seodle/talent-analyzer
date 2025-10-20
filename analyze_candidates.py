@@ -225,7 +225,11 @@ def build_scoring_prompt(criteria_list: List[str], candidate_name: str, cv_text:
         "Le JSON doit contenir les clés: name, cv_relevance, letter_relevance, seniority, overall_score, fit_summary, risks, criteria_checklist. "
         "criteria_checklist est une liste d'objets {criterion, status, source, evidence, confidence}. "
         "status ∈ {met, partial, not_met}. source ∈ {cv, letter, both, none}. confidence ∈ [0,100]. "
-        "Pour evidence, cite une courte phrase ou mot-clé trouvé."
+        "Pour evidence, cite une courte phrase ou mot-clé trouvé. "
+        "IMPORTANT: Retourne EXACTEMENT un élément de criteria_checklist pour CHAQUE critère fourni, en recopiant le libellé du critère à l'identique dans 'criterion'. "
+        "N'invente pas d'informations: si aucune preuve n'est trouvée dans les textes fournis, utilise status='not_met', source='none' et confidence=0. "
+        "Assure la cohérence globale: 'overall_score' doit être cohérent avec la checklist en utilisant la règle (met=1, partial=0.5, not_met=0), normalisée sur 10. "
+        "La 'fit_summary' doit refléter le niveau réel d'adéquation observé dans la checklist."
     )
 
     json_schema_hint = {
@@ -307,6 +311,48 @@ def normalize_source(value: Optional[str]) -> str:
     if v in {"both", "cv+letter", "cv_letter"}:
         return "both"
     return "none"
+
+
+def compute_overall_from_checklist(checklist: List[Dict[str, object]], default_when_empty: int = 0) -> int:
+    total = len(checklist)
+    if total == 0:
+        return default_when_empty
+    score_sum = 0.0
+    for item in checklist:
+        status = str(item.get("status", "")).lower()
+        if status == "met":
+            score_sum += 1.0
+        elif status == "partial":
+            score_sum += 0.5
+        # not_met contributes 0
+    normalized = (score_sum / float(total)) * 10.0
+    try:
+        return int(round(normalized))
+    except Exception:
+        return default_when_empty
+
+
+def summarize_fit_from_checklist(candidate_name: str, checklist: List[Dict[str, object]]) -> str:
+    if not checklist:
+        return "Analyse des critères indisponible."
+    met = sum(1 for i in checklist if str(i.get("status", "")).lower() == "met")
+    partial = sum(1 for i in checklist if str(i.get("status", "")).lower() == "partial")
+    not_met = len(checklist) - met - partial
+    ratio_met = (met + 0.5 * partial) / max(1, len(checklist))
+    if ratio_met < 0.2:
+        return (
+            "Les documents fournis ne démontrent pas l'adéquation au poste: "
+            f"{met} critères satisfaits, {partial} partiels, {not_met} non satisfaits."
+        )
+    if ratio_met < 0.5:
+        return (
+            "Adéquation partielle: "
+            f"{met} critères satisfaits, {partial} partiels, {not_met} non satisfaits."
+        )
+    return (
+        "Bonne adéquation globale: "
+        f"{met} critères satisfaits, {partial} partiels, {not_met} non satisfaits."
+    )
 
 
 def evaluate_candidate(criteria_list: List[str], docs: CandidateDocs, product_id: str, api_key: str) -> Dict:
@@ -398,6 +444,28 @@ def evaluate_candidate(criteria_list: List[str], docs: CandidateDocs, product_id
         "risks": str(parsed.get("risks", "")).strip(),
         "criteria_checklist": completed_checklist,
     })
+
+    # Cohérence post-traitement: si la checklist contredit fortement la synthèse/score, aligne avec la checklist
+    try:
+        calc_overall = compute_overall_from_checklist(completed_checklist, default_when_empty=overall)
+        met_count = sum(1 for i in completed_checklist if str(i.get("status", "")).lower() == "met")
+        partial_count = sum(1 for i in completed_checklist if str(i.get("status", "")).lower() == "partial")
+        total_count = len(completed_checklist)
+        not_met_count = total_count - met_count - partial_count
+        ratio_met = (met_count + 0.5 * partial_count) / max(1, total_count)
+
+        # Override overall_score if deviation is large or if checklist indicates faible adéquation
+        if total_count > 0 and (abs(overall - calc_overall) >= 4 or ratio_met < 0.3 and overall >= 5):
+            result["overall_score"] = calc_overall
+
+        # If summary is empty or the checklist is overwhelmingly negative, provide a consistent summary
+        current_summary = result.get("fit_summary", "").strip()
+        if not current_summary or ratio_met < 0.3:
+            result["fit_summary"] = summarize_fit_from_checklist(docs.candidate_name, completed_checklist)
+    except Exception:
+        # En cas d'erreur, on laisse les valeurs d'origine
+        pass
+
     return result
 
 
