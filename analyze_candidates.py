@@ -1,0 +1,400 @@
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from dotenv import load_dotenv
+from tqdm import tqdm
+import unicodedata
+
+# PDF and DOCX parsing
+import pdfplumber
+from docx import Document
+
+
+@dataclass
+class CandidateDocs:
+    candidate_name: str
+    cv_path: Optional[Path]
+    letter_path: Optional[Path]
+    other_files: List[Path]
+
+
+def normalize_string(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.lower()
+
+
+def score_for_type(filename: str, target: str) -> int:
+    name = normalize_string(filename)
+    # Keywords tuned for French and general cases
+    cv_keywords = [
+        "cv", "curriculum", "vitae", "curriculum vitae", "résumé", "resume", "c.v"
+    ]
+    letter_keywords = [
+        "lettre", "motivation", "lm", "cover", "letter"
+    ]
+    keywords = cv_keywords if target == "cv" else letter_keywords
+    score = 0
+    for kw in keywords:
+        if kw in name:
+            score += 1
+    # Bonus if keyword appears as a separate token-like pattern
+    if re.search(r"\b(cv|lm)\b", name):
+        score += 1
+    return score
+
+
+def classify_candidate_files(candidate_dir: Path) -> CandidateDocs:
+    files = [p for p in candidate_dir.iterdir() if p.is_file()]
+    supported_exts = {".pdf", ".docx"}
+    supported_files = [p for p in files if p.suffix.lower() in supported_exts]
+
+    best_cv: Optional[Tuple[int, Path]] = None
+    best_letter: Optional[Tuple[int, Path]] = None
+    others: List[Path] = []
+
+    for path in supported_files:
+        cv_score = score_for_type(path.name, "cv")
+        letter_score = score_for_type(path.name, "letter")
+        if cv_score > 0 and (best_cv is None or cv_score > best_cv[0] or (cv_score == best_cv[0] and path.stat().st_size > best_cv[1].stat().st_size)):
+            best_cv = (cv_score, path)
+        if letter_score > 0 and (best_letter is None or letter_score > best_letter[0] or (letter_score == best_letter[0] and path.stat().st_size > best_letter[1].stat().st_size)):
+            best_letter = (letter_score, path)
+
+    # Collect remaining as others
+    chosen = {best_cv[1] for best_cv in [best_cv] if best_cv is not None} | {best_letter[1] for best_letter in [best_letter] if best_letter is not None}
+    for p in supported_files:
+        if p not in chosen:
+            others.append(p)
+
+    return CandidateDocs(
+        candidate_name=candidate_dir.name,
+        cv_path=best_cv[1] if best_cv else None,
+        letter_path=best_letter[1] if best_letter else None,
+        other_files=others,
+    )
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    texts: List[str] = []
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            texts.append(page_text)
+    return "\n\n".join(texts).strip()
+
+
+def extract_text_from_docx(path: Path) -> str:
+    doc = Document(str(path))
+    paras = [p.text for p in doc.paragraphs if p.text]
+    return "\n".join(paras).strip()
+
+
+def extract_text_from_file(path: Optional[Path]) -> str:
+    if path is None:
+        return ""
+    try:
+        if path.suffix.lower() == ".pdf":
+            return extract_text_from_pdf(path)
+        if path.suffix.lower() == ".docx":
+            return extract_text_from_docx(path)
+        return ""
+    except Exception as exc:
+        return f"[Erreur d'extraction: {exc}]"
+
+
+def truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n[TRONQUÉ]"
+
+
+def read_env() -> Tuple[str, str]:
+    load_dotenv()
+    product_id = os.getenv("product_id")
+    api_key = os.getenv("api_key")
+    if not product_id or not api_key:
+        raise RuntimeError("Variables d'environnement manquantes: product_id et/ou api_key dans .env")
+    return product_id, api_key
+
+
+def call_infomaniak_llm(prompt: str, product_id: str, api_key: str, timeout_seconds: int = 120) -> str:
+    url = f"https://api.infomaniak.com/1/ai/{product_id}/openai/chat/completions"
+    payload = {
+        "model": "llama3",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_seconds)
+    if response.status_code != 200:
+        raise RuntimeError(f"Erreur API {response.status_code}: {response.text[:500]}")
+    data = response.json()
+    # Common OpenAI-compatible shape
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        # Fallback to alternative shapes
+        if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
+            choice = data["choices"][0]
+            if isinstance(choice, dict):
+                msg = choice.get("message") or choice.get("delta") or {}
+                if isinstance(msg, dict) and "content" in msg:
+                    return msg["content"]
+        return json.dumps(data)
+
+
+def build_scoring_prompt(criteria: str, candidate_name: str, cv_text: str, letter_text: str, has_cv: bool, has_letter: bool) -> str:
+    criteria = criteria.strip()
+    cv_text = truncate_text(cv_text.strip(), 12000)
+    letter_text = truncate_text(letter_text.strip(), 8000)
+    missing = []
+    if not has_cv:
+        missing.append("CV manquant")
+    if not has_letter:
+        missing.append("Lettre de motivation manquante")
+    missing_note = ", ".join(missing) if missing else ""
+
+    instruction = (
+        "Tu es un assistant de recrutement francophone. Évalue ce candidat par rapport aux critères donnés. "
+        "Réponds UNIQUEMENT avec un JSON valide, sans texte additionnel. "
+        "Le JSON doit contenir les clés: name, cv_relevance, letter_relevance, seniority, overall_score, fit_summary, risks. "
+        "Les scores sont sur 0-100. Pèse l'absence de documents s'il y en a."
+    )
+
+    json_schema_hint = {
+        "name": candidate_name,
+        "cv_relevance": 0,
+        "letter_relevance": 0,
+        "seniority": 0,
+        "overall_score": 0,
+        "fit_summary": "",
+        "risks": ""
+    }
+
+    prompt = (
+        f"{instruction}\n\n"
+        f"Critères du poste:\n{criteria}\n\n"
+        f"Informations manquantes: {missing_note if missing_note else 'Aucune'}\n\n"
+        f"=== CV ===\n{cv_text}\n\n=== Lettre de motivation ===\n{letter_text}\n\n"
+        f"Schéma JSON attendu (exemple de structure, valeurs à recalculer):\n{json.dumps(json_schema_hint, ensure_ascii=False)}"
+    )
+    return prompt
+
+
+def try_parse_json(text: str) -> Optional[Dict]:
+    text = text.strip()
+    # Direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Extract first JSON object heuristically
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        candidate = match.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    return None
+
+
+def safe_int(value: Optional[object]) -> int:
+    try:
+        if value is None:
+            return 0
+        if isinstance(value, (int, float)):
+            return int(round(float(value)))
+        if isinstance(value, str):
+            num = re.findall(r"-?\d+\.?\d*", value)
+            return int(round(float(num[0]))) if num else 0
+        return 0
+    except Exception:
+        return 0
+
+
+def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_key: str) -> Dict:
+    cv_text = extract_text_from_file(docs.cv_path)
+    letter_text = extract_text_from_file(docs.letter_path)
+    has_cv = docs.cv_path is not None and bool(cv_text.strip())
+    has_letter = docs.letter_path is not None and bool(letter_text.strip())
+
+    prompt = build_scoring_prompt(criteria, docs.candidate_name, cv_text, letter_text, has_cv, has_letter)
+
+    try:
+        response_text = call_infomaniak_llm(prompt, product_id, api_key)
+        parsed = try_parse_json(response_text)
+    except Exception as exc:
+        parsed = None
+        response_text = f"[Erreur API: {exc}]"
+
+    result: Dict[str, object] = {
+        "candidate_name": docs.candidate_name,
+        "has_cv": has_cv,
+        "has_letter": has_letter,
+        "cv_path": str(docs.cv_path) if docs.cv_path else "",
+        "letter_path": str(docs.letter_path) if docs.letter_path else "",
+        "raw_response": response_text,
+    }
+
+    if parsed is None:
+        # Fallback minimal scoring when LLM fails
+        result.update({
+            "cv_relevance": 0,
+            "letter_relevance": 0,
+            "seniority": 0,
+            "overall_score": 0,
+            "fit_summary": "Échec de l'analyse LLM",
+            "risks": "Réponse non exploitable",
+        })
+        return result
+
+    cv_rel = safe_int(parsed.get("cv_relevance"))
+    lt_rel = safe_int(parsed.get("letter_relevance"))
+    seniority = safe_int(parsed.get("seniority"))
+    overall = safe_int(parsed.get("overall_score"))
+
+    result.update({
+        "cv_relevance": cv_rel,
+        "letter_relevance": lt_rel,
+        "seniority": seniority,
+        "overall_score": overall,
+        "fit_summary": str(parsed.get("fit_summary", "")).strip(),
+        "risks": str(parsed.get("risks", "")).strip(),
+    })
+    return result
+
+
+def find_candidate_dirs(root: Path) -> List[Path]:
+    return [p for p in root.iterdir() if p.is_dir()]
+
+
+def save_csv(rows: List[Dict], out_path: Path) -> None:
+    fieldnames = [
+        "candidate_name",
+        "overall_score",
+        "cv_relevance",
+        "letter_relevance",
+        "seniority",
+        "has_cv",
+        "has_letter",
+        "cv_path",
+        "letter_path",
+        "fit_summary",
+        "risks",
+    ]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def save_markdown(rows: List[Dict], out_path: Path, top_n: int) -> None:
+    lines: List[str] = []
+    lines.append("# Classement des candidats\n")
+    for idx, row in enumerate(rows[:top_n], start=1):
+        lines.append(f"## {idx}. {row['candidate_name']} — Score global: {row['overall_score']}")
+        lines.append("")
+        lines.append(f"- CV: {row['cv_relevance']} | Lettre: {row['letter_relevance']} | Séniorité: {row['seniority']}")
+        lines.append(f"- CV trouvé: {row['has_cv']} | Lettre trouvée: {row['has_letter']}")
+        if row.get("fit_summary"):
+            lines.append("")
+            lines.append("**Synthèse**:")
+            lines.append("")
+            lines.append(row["fit_summary"])
+        if row.get("risks"):
+            lines.append("")
+            lines.append("**Risques**:")
+            lines.append("")
+            lines.append(row["risks"])
+        lines.append("")
+
+    missing: List[str] = []
+    for row in rows:
+        notes = []
+        if not row["has_cv"]:
+            notes.append("CV manquant")
+        if not row["has_letter"]:
+            notes.append("Lettre manquante")
+        if notes:
+            missing.append(f"- {row['candidate_name']}: {', '.join(notes)}")
+    if missing:
+        lines.append("---\n")
+        lines.append("## Dossiers incomplets\n")
+        lines.extend(missing)
+        lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Analyse de candidats avec Llama 3 (Infomaniak)")
+    parser.add_argument("--criteria", type=str, default="", help="Critères du poste (texte)")
+    parser.add_argument("--criteria-file", type=str, default="", help="Fichier texte avec les critères du poste")
+    parser.add_argument("--candidates-dir", type=str, default="candidats", help="Dossier contenant les dossiers des candidats")
+    parser.add_argument("--output-dir", type=str, default=".", help="Dossier de sortie pour les rapports")
+    parser.add_argument("--top", type=int, default=10, help="Nombre de candidats à afficher dans le rapport Markdown")
+    args = parser.parse_args()
+
+    criteria_text = args.criteria.strip()
+    if args.criteria_file:
+        criteria_path = Path(args.criteria_file)
+        if not criteria_path.exists():
+            print(f"Fichier de critères introuvable: {criteria_path}", file=sys.stderr)
+            sys.exit(1)
+        criteria_text = criteria_path.read_text(encoding="utf-8").strip()
+
+    if not criteria_text:
+        print("Veuillez fournir des critères via --criteria ou --criteria-file", file=sys.stderr)
+        sys.exit(1)
+
+    product_id, api_key = read_env()
+
+    candidates_root = Path(args.candidates_dir)
+    if not candidates_root.exists():
+        print(f"Dossier candidats introuvable: {candidates_root}", file=sys.stderr)
+        sys.exit(1)
+
+    candidate_dirs = find_candidate_dirs(candidates_root)
+    if not candidate_dirs:
+        print("Aucun dossier candidat trouvé.", file=sys.stderr)
+        sys.exit(1)
+
+    results: List[Dict] = []
+    for cand_dir in tqdm(candidate_dirs, desc="Analyse des candidats"):
+        docs = classify_candidate_files(cand_dir)
+        result = evaluate_candidate(criteria_text, docs, product_id, api_key)
+        results.append(result)
+
+    # Sort by overall_score desc
+    results.sort(key=lambda r: r.get("overall_score", 0), reverse=True)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = output_dir / "report_candidates.csv"
+    md_path = output_dir / "report_candidates.md"
+
+    save_csv(results, csv_path)
+    save_markdown(results, md_path, args.top)
+
+    print(f"Rapports générés:\n- {csv_path}\n- {md_path}")
+
+
+if __name__ == "__main__":
+    main()
