@@ -1,4 +1,5 @@
 import argparse
+import logging
 import csv
 import json
 import os
@@ -17,6 +18,21 @@ import unicodedata
 import pdfplumber
 from docx import Document
 
+
+def setup_logging(verbose: bool, log_file: str) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    handlers = []
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handlers.append(console_handler)
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handlers.append(file_handler)
+
+    logging.basicConfig(level=level, handlers=handlers)
 
 @dataclass
 class CandidateDocs:
@@ -53,9 +69,11 @@ def score_for_type(filename: str, target: str) -> int:
 
 
 def classify_candidate_files(candidate_dir: Path) -> CandidateDocs:
+    logging.debug(f"Analyse des fichiers dans: {candidate_dir}")
     files = [p for p in candidate_dir.iterdir() if p.is_file()]
     supported_exts = {".pdf", ".docx"}
     supported_files = [p for p in files if p.suffix.lower() in supported_exts]
+    logging.debug(f"Fichiers supportés trouvés ({len(supported_files)}): {[p.name for p in supported_files]}")
 
     best_cv: Optional[Tuple[int, Path]] = None
     best_letter: Optional[Tuple[int, Path]] = None
@@ -64,6 +82,7 @@ def classify_candidate_files(candidate_dir: Path) -> CandidateDocs:
     for path in supported_files:
         cv_score = score_for_type(path.name, "cv")
         letter_score = score_for_type(path.name, "letter")
+        logging.debug(f"Scores {path.name} -> CV:{cv_score} Lettre:{letter_score}")
         if cv_score > 0 and (best_cv is None or cv_score > best_cv[0] or (cv_score == best_cv[0] and path.stat().st_size > best_cv[1].stat().st_size)):
             best_cv = (cv_score, path)
         if letter_score > 0 and (best_letter is None or letter_score > best_letter[0] or (letter_score == best_letter[0] and path.stat().st_size > best_letter[1].stat().st_size)):
@@ -74,6 +93,15 @@ def classify_candidate_files(candidate_dir: Path) -> CandidateDocs:
     for p in supported_files:
         if p not in chosen:
             others.append(p)
+
+    if best_cv is None:
+        logging.warning(f"CV non détecté pour {candidate_dir.name}")
+    else:
+        logging.debug(f"CV sélectionné: {best_cv[1].name}")
+    if best_letter is None:
+        logging.warning(f"Lettre de motivation non détectée pour {candidate_dir.name}")
+    else:
+        logging.debug(f"Lettre sélectionnée: {best_letter[1].name}")
 
     return CandidateDocs(
         candidate_name=candidate_dir.name,
@@ -103,11 +131,16 @@ def extract_text_from_file(path: Optional[Path]) -> str:
         return ""
     try:
         if path.suffix.lower() == ".pdf":
-            return extract_text_from_pdf(path)
+            text = extract_text_from_pdf(path)
+            logging.debug(f"Texte PDF extrait {path.name} ({len(text)} chars)")
+            return text
         if path.suffix.lower() == ".docx":
-            return extract_text_from_docx(path)
+            text = extract_text_from_docx(path)
+            logging.debug(f"Texte DOCX extrait {path.name} ({len(text)} chars)")
+            return text
         return ""
     except Exception as exc:
+        logging.exception(f"Erreur d'extraction pour {path}: {exc}")
         return f"[Erreur d'extraction: {exc}]"
 
 
@@ -119,10 +152,11 @@ def truncate_text(value: str, max_chars: int) -> str:
 
 def read_env() -> Tuple[str, str]:
     load_dotenv()
-    product_id = os.getenv("product_id")
-    api_key = os.getenv("api_key")
+    product_id = os.getenv("PRODUCT_ID")
+    api_key = os.getenv("INFOMANIAK_API_KEY")
+
     if not product_id or not api_key:
-        raise RuntimeError("Variables d'environnement manquantes: product_id et/ou api_key dans .env")
+        raise RuntimeError("Variables d'environnement manquantes: PRODUCT_ID et/ou INFOMANIAK_API_KEY dans .env")
     return product_id, api_key
 
 
@@ -138,13 +172,17 @@ def call_infomaniak_llm(prompt: str, product_id: str, api_key: str, timeout_seco
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    logging.debug(f"Appel API Infomaniak {url} (prompt {len(prompt)} chars)")
     response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_seconds)
     if response.status_code != 200:
+        logging.error(f"Erreur API {response.status_code}: {response.text[:500]}")
         raise RuntimeError(f"Erreur API {response.status_code}: {response.text[:500]}")
     data = response.json()
     # Common OpenAI-compatible shape
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        logging.debug(f"Réponse API reçue ({len(content)} chars)")
+        return content
     except Exception:
         # Fallback to alternative shapes
         if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
@@ -152,7 +190,9 @@ def call_infomaniak_llm(prompt: str, product_id: str, api_key: str, timeout_seco
             if isinstance(choice, dict):
                 msg = choice.get("message") or choice.get("delta") or {}
                 if isinstance(msg, dict) and "content" in msg:
-                    return msg["content"]
+                    content = msg["content"]
+                    logging.debug(f"Réponse API (fallback) reçue ({len(content)} chars)")
+                    return content
         return json.dumps(data)
 
 
@@ -232,6 +272,7 @@ def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_
     letter_text = extract_text_from_file(docs.letter_path)
     has_cv = docs.cv_path is not None and bool(cv_text.strip())
     has_letter = docs.letter_path is not None and bool(letter_text.strip())
+    logging.info(f"Évaluation {docs.candidate_name} (CV:{has_cv} Lettre:{has_letter})")
 
     prompt = build_scoring_prompt(criteria, docs.candidate_name, cv_text, letter_text, has_cv, has_letter)
 
@@ -241,6 +282,7 @@ def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_
     except Exception as exc:
         parsed = None
         response_text = f"[Erreur API: {exc}]"
+        logging.exception(f"Échec appel LLM pour {docs.candidate_name}: {exc}")
 
     result: Dict[str, object] = {
         "candidate_name": docs.candidate_name,
@@ -280,7 +322,7 @@ def evaluate_candidate(criteria: str, docs: CandidateDocs, product_id: str, api_
 
 
 def find_candidate_dirs(root: Path) -> List[Path]:
-    return [p for p in root.iterdir() if p.is_dir()]
+    return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
 
 
 def save_csv(rows: List[Dict], out_path: Path) -> None:
@@ -344,39 +386,52 @@ def save_markdown(rows: List[Dict], out_path: Path, top_n: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyse de candidats avec Llama 3 (Infomaniak)")
-    parser.add_argument("--criteria", type=str, default="", help="Critères du poste (texte)")
-    parser.add_argument("--criteria-file", type=str, default="", help="Fichier texte avec les critères du poste")
+    parser.add_argument("--criteria", type=str, default="", help="(Obsolète) Critères inline — le script lit désormais criteria.txt")
+    parser.add_argument("--criteria-file", type=str, default="criteria.txt", help="Fichier texte avec les critères du poste (par défaut: criteria.txt)")
     parser.add_argument("--candidates-dir", type=str, default="candidats", help="Dossier contenant les dossiers des candidats")
     parser.add_argument("--output-dir", type=str, default=".", help="Dossier de sortie pour les rapports")
     parser.add_argument("--top", type=int, default=10, help="Nombre de candidats à afficher dans le rapport Markdown")
+    parser.add_argument("--limit", type=int, default=0, help="Limiter l'analyse aux N premiers dossiers (0 = tous)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Activer les logs détaillés (DEBUG)")
+    parser.add_argument("--log-file", type=str, default="", help="Écrire les logs dans ce fichier")
     args = parser.parse_args()
 
-    criteria_text = args.criteria.strip()
-    if args.criteria_file:
-        criteria_path = Path(args.criteria_file)
-        if not criteria_path.exists():
-            print(f"Fichier de critères introuvable: {criteria_path}", file=sys.stderr)
-            sys.exit(1)
-        criteria_text = criteria_path.read_text(encoding="utf-8").strip()
+    setup_logging(args.verbose, args.log_file)
 
+    # Critères toujours lus à partir d'un fichier texte (par défaut criteria.txt)
+    criteria_path = Path(args.criteria_file)
+    if not criteria_path.exists():
+        logging.error(f"Fichier de critères introuvable: {criteria_path}")
+        print(f"Fichier de critères introuvable: {criteria_path}. Fournissez --criteria-file ou créez criteria.txt", file=sys.stderr)
+        sys.exit(1)
+    criteria_text = criteria_path.read_text(encoding="utf-8").strip()
     if not criteria_text:
-        print("Veuillez fournir des critères via --criteria ou --criteria-file", file=sys.stderr)
+        logging.error(f"Le fichier de critères est vide: {criteria_path}")
+        print(f"Le fichier de critères est vide: {criteria_path}", file=sys.stderr)
         sys.exit(1)
 
     product_id, api_key = read_env()
 
     candidates_root = Path(args.candidates_dir)
     if not candidates_root.exists():
+        logging.error(f"Dossier candidats introuvable: {candidates_root}")
         print(f"Dossier candidats introuvable: {candidates_root}", file=sys.stderr)
         sys.exit(1)
 
     candidate_dirs = find_candidate_dirs(candidates_root)
+    logging.info(f"Dossiers candidats trouvés: {len(candidate_dirs)}")
+    if args.limit and args.limit > 0:
+        candidate_dirs = candidate_dirs[: args.limit]
+        logging.info(f"Limitation active: analyse des {len(candidate_dirs)} premiers dossiers")
+        print(f"Limitation active: analyse des {len(candidate_dirs)} premiers dossiers")
     if not candidate_dirs:
+        logging.warning("Aucun dossier candidat trouvé.")
         print("Aucun dossier candidat trouvé.", file=sys.stderr)
         sys.exit(1)
 
     results: List[Dict] = []
     for cand_dir in tqdm(candidate_dirs, desc="Analyse des candidats"):
+        logging.debug(f"Traitement dossier: {cand_dir.name}")
         docs = classify_candidate_files(cand_dir)
         result = evaluate_candidate(criteria_text, docs, product_id, api_key)
         results.append(result)
@@ -394,7 +449,8 @@ def main() -> None:
     save_markdown(results, md_path, args.top)
 
     print(f"Rapports générés:\n- {csv_path}\n- {md_path}")
-
+    if args.log_file:
+        print(f"Logs détaillés: {args.log_file}")
 
 if __name__ == "__main__":
     main()
