@@ -479,7 +479,6 @@ def save_csv(rows: List[Dict], out_path: Path) -> None:
         "overall_score",
         "cv_relevance",
         "letter_relevance",
-        "seniority",
         "has_cv",
         "has_letter",
         "cv_path",
@@ -487,20 +486,52 @@ def save_csv(rows: List[Dict], out_path: Path) -> None:
         "fit_summary",
         "risks",
     ]
-    with out_path.open("w", newline="", encoding="utf-8") as f:
+    file_exists = out_path.exists()
+    write_header = True
+    if file_exists:
+        try:
+            if out_path.stat().st_size == 0:
+                write_header = True
+            else:
+                # Detect header mismatch (schema change between runs)
+                with out_path.open("r", encoding="utf-8") as rf:
+                    first_line = ""
+                    for line in rf:
+                        if line.strip():
+                            first_line = line.strip()
+                            break
+                current_header = ",".join(fieldnames)
+                write_header = first_line != current_header
+        except Exception:
+            # On any error, write header to be safe
+            write_header = True
+    with out_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        if not file_exists or write_header:
+            writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 def save_markdown(rows: List[Dict], out_path: Path, top_n: int) -> None:
     lines: List[str] = []
-    lines.append("# Classement des candidats\n")
+    file_exists = out_path.exists()
+    file_has_content = False
+    if file_exists:
+        try:
+            file_has_content = out_path.stat().st_size > 0
+        except Exception:
+            file_has_content = True
+
+    if not file_has_content:
+        lines.append("# Classement des candidats\n")
+    else:
+        # Separate runs
+        lines.append("\n---\n\n")
     for idx, row in enumerate(rows[:top_n], start=1):
-        lines.append(f"## {idx}. {row['candidate_name']} — Score global: {row['overall_score']}")
+        lines.append(f"## {idx}. {row['candidate_name']} — Score global: {row['overall_score']} / 10")
         lines.append("")
-        lines.append(f"- CV: {row['cv_relevance']} | Lettre: {row['letter_relevance']} | Séniorité: {row['seniority']}")
+        lines.append(f"- CV: {row['cv_relevance']} | Lettre: {row['letter_relevance']}")
         lines.append(f"- CV trouvé: {row['has_cv']} | Lettre trouvée: {row['has_letter']}")
         # Criteria checklist before synthesis
         checklist = row.get("criteria_checklist") or []
@@ -559,7 +590,8 @@ def save_markdown(rows: List[Dict], out_path: Path, top_n: int) -> None:
         lines.extend(missing)
         lines.append("")
 
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    with out_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def main() -> None:
